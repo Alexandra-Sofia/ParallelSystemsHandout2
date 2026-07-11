@@ -39,6 +39,15 @@
 #define SIMD_WIDTH 8
 
 /**
+ * @brief The timings the assignment requires the program to report.
+ */
+typedef struct {
+    double init;   /**< Allocating and generating the polynomials. */
+    double scalar; /**< The original scalar multiplication. */
+    double simd;   /**< The vectorised multiplication. */
+} timings_t;
+
+/**
  * @brief Return the current monotonic time in seconds.
  *
  * @return Wall-clock time as a double, in seconds.
@@ -223,6 +232,56 @@ static int results_match(int *a, int *b, int size)
     return 1;
 }
 
+
+/**
+ * @brief Allocate the polynomials and fill them with random coefficients.
+ *
+ * The two output arrays are zeroed because both kernels accumulate into them.
+ *
+ * @param a             Output: pointer to the first polynomial.
+ * @param b             Output: pointer to the second polynomial.
+ * @param result_scalar Output: pointer to the scalar result array.
+ * @param result_simd   Output: pointer to the vector result array.
+ * @param degree        Degree of each input polynomial.
+ * @return Elapsed time of the allocation and generation, in seconds.
+ */
+static double generate_polynomials(int **a, int **b, int **result_scalar,
+                                   int **result_simd, int degree)
+{
+    int size = degree + 1;
+    int result_size = 2 * degree + 1;
+
+    double start = now();
+
+    *a = xmalloc((size_t)size, sizeof(int));
+    *b = xmalloc((size_t)size, sizeof(int));
+    *result_scalar = xcalloc((size_t)result_size, sizeof(int));
+    *result_simd = xcalloc((size_t)result_size, sizeof(int));
+
+    srand(SEED);
+    for (int i = 0; i < size; i++) {
+        (*a)[i] = (rand() % MAX_COEFF) + 1;
+        (*b)[i] = (rand() % MAX_COEFF) + 1;
+    }
+
+    return now() - start;
+}
+
+/**
+ * @brief Print the configuration and all required timings.
+ *
+ * @param t      Collected timings.
+ * @param degree Degree of each input polynomial.
+ */
+static void print_report(const timings_t *t, int degree)
+{
+    printf("Degree:        %d\n", degree);
+    printf("Init time:     %.6f s\n", t->init);
+    printf("Scalar time:   %.6f s\n", t->scalar);
+    printf("SIMD time:     %.6f s\n", t->simd);
+    printf("Speedup:       %.2fx\n", t->scalar / t->simd);
+}
+
 /**
  * @brief Program entry point.
  *
@@ -241,47 +300,34 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int size = degree + 1;
     int result_size = 2 * degree + 1;
 
     fprintf(stderr, "[ex3] degree=%d\n", degree);
     fprintf(stderr, "[ex3] allocating and generating polynomials...\n");
 
-    double t_start = now();
+    int *a;
+    int *b;
+    int *result_scalar;
+    int *result_simd;
+    timings_t t = { 0.0, 0.0, 0.0 };
 
-    int *a = xmalloc((size_t)size, sizeof(int));
-    int *b = xmalloc((size_t)size, sizeof(int));
-    int *result_scalar = xcalloc((size_t)result_size, sizeof(int));
-    int *result_simd = xcalloc((size_t)result_size, sizeof(int));
+    t.init = generate_polynomials(&a, &b, &result_scalar, &result_simd, degree);
+    fprintf(stderr, "[ex3] init done (%.6f s)\n", t.init);
 
-    srand(SEED);
-    for (int i = 0; i < size; i++) {
-        a[i] = (rand() % MAX_COEFF) + 1;
-        b[i] = (rand() % MAX_COEFF) + 1;
-    }
-
-    double t_init = now() - t_start;
-    printf("Init time:     %.6f s\n", t_init);
-    fprintf(stderr, "[ex3] init done (%.6f s)\n", t_init);
-
-    /* Scalar multiplication */
     fprintf(stderr, "[ex3] running scalar multiply...\n");
-    double t0 = now();
+    double start = now();
     poly_multiply_scalar(a, b, result_scalar, degree);
-    double t_scalar = now() - t0;
-    printf("Scalar time:   %.6f s\n", t_scalar);
-    fprintf(stderr, "[ex3] scalar done (%.6f s)\n", t_scalar);
+    t.scalar = now() - start;
+    fprintf(stderr, "[ex3] scalar done (%.6f s)\n", t.scalar);
 
-    /* Vectorised multiplication */
     fprintf(stderr, "[ex3] running SIMD multiply...\n");
-    double t1 = now();
+    start = now();
     poly_multiply_simd(a, b, result_simd, degree);
-    double t_simd = now() - t1;
-    printf("SIMD time:     %.6f s\n", t_simd);
-    printf("Speedup:       %.2fx\n", t_scalar / t_simd);
-    fprintf(stderr, "[ex3] SIMD done (%.6f s)\n", t_simd);
+    t.simd = now() - start;
+    fprintf(stderr, "[ex3] SIMD done (%.6f s)\n", t.simd);
 
-    /* Verification */
+    print_report(&t, degree);
+
     fprintf(stderr, "[ex3] verifying results...\n");
     int ok = results_match(result_scalar, result_simd, result_size);
     printf("Correctness:   %s\n", ok ? "[OK]" : "[FAIL]");

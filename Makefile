@@ -1,11 +1,11 @@
-CC      = gcc
-MPICC   = mpicc
-CFLAGS  = -O2 -Wall -Wextra -Wpedantic -std=c11 -fopenmp
+CC        = gcc
+MPICC     = mpicc
+CFLAGS    = -O2 -Wall -Wextra -Wpedantic -std=c11 -fopenmp -pthread
 SIMDFLAGS = -mavx2
-LDFLAGS = -fopenmp -lm
-SRCDIR  = src
-BINDIR  = bin
-TARGETS = $(addprefix $(BINDIR)/,ex1 ex2 ex3)
+LDFLAGS   = -fopenmp -pthread -lm
+SRCDIR    = src
+BINDIR    = bin
+TARGETS   = $(addprefix $(BINDIR)/,ex1 ex2 ex3)
 
 .PHONY: all clean
 

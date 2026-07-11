@@ -62,6 +62,18 @@ typedef struct {
 } csr_matrix_t;
 
 /**
+ * @brief The timings the assignment requires the program to report.
+ */
+typedef struct {
+    double csr_build;   /**< Building the CSR representation on rank 0. */
+    double csr_send;    /**< Distributing the CSR rows and the input vector. */
+    double csr_compute; /**< The iterative parallel CSR multiplication. */
+    double csr_total;   /**< Build plus send plus compute. */
+    double dense_total; /**< The same iteration using the dense form. */
+    double csr_serial;  /**< The serial CSR reference run on rank 0. */
+} timings_t;
+
+/**
  * @brief Parse a string as a positive integer using strtol.
  *
  * @param str   Input string.
@@ -436,6 +448,182 @@ static int vectors_match(long long *a, long long *b, int n)
     return 1;
 }
 
+
+/**
+ * @brief Run the iterative parallel CSR multiplication.
+ *
+ * Each rank multiplies the rows it owns, then all ranks exchange their partial
+ * result vectors so that every rank holds the complete input vector for the
+ * next iteration. That exchange is the synchronisation point of the algorithm.
+ *
+ * @param local       CSR block owned by this rank.
+ * @param x0          Initial input vector (size n), identical on all ranks.
+ * @param x           Scratch vector (size n) reused as the iteration input.
+ * @param y_local     Scratch vector (size local_rows) for this rank's output.
+ * @param out         Output: final result vector (size n).
+ * @param counts      Row count per rank.
+ * @param displs      First row index per rank.
+ * @param n           Matrix dimension.
+ * @param local_rows  Rows owned by this rank.
+ * @param iterations  Number of multiplications to perform.
+ * @return Elapsed time of the iterative computation, in seconds.
+ */
+static double run_csr_parallel(const csr_matrix_t *local, const long long *x0,
+                               long long *x, long long *y_local, long long *out,
+                               const int *counts, const int *displs, int n,
+                               int local_rows, int iterations)
+{
+    memcpy(x, x0, (size_t)n * sizeof(long long));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+
+    for (int it = 0; it < iterations; it++) {
+        spmv_csr(local, x, y_local);
+        MPI_Allgatherv(y_local, local_rows, MPI_LONG_LONG,
+                       x, counts, displs, MPI_LONG_LONG, MPI_COMM_WORLD);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double elapsed = MPI_Wtime() - start;
+
+    memcpy(out, x, (size_t)n * sizeof(long long));
+    return elapsed;
+}
+
+/**
+ * @brief Run the same iteration using the dense representation.
+ *
+ * The dense rows are scattered with the same row decomposition, so the two
+ * representations are compared at the same process count. The scatter is inside
+ * the timed region because the CSR total likewise includes its distribution
+ * step, which keeps the two totals comparable.
+ *
+ * @param mat        Full dense matrix on rank 0; ignored on other ranks.
+ * @param x0         Initial input vector (size n).
+ * @param x          Scratch vector (size n) reused as the iteration input.
+ * @param y_local    Scratch vector (size local_rows) for this rank's output.
+ * @param out        Output: final result vector (size n).
+ * @param counts     Row count per rank.
+ * @param displs     First row index per rank.
+ * @param n          Matrix dimension.
+ * @param local_rows Rows owned by this rank.
+ * @param num_procs  Number of MPI ranks.
+ * @param iterations Number of multiplications to perform.
+ * @return Elapsed time including the scatter, in seconds.
+ */
+static double run_dense_parallel(const int *mat, const long long *x0,
+                                 long long *x, long long *y_local,
+                                 long long *out, const int *counts,
+                                 const int *displs, int n, int local_rows,
+                                 int num_procs, int iterations)
+{
+    int *sendcounts = xmalloc((size_t)num_procs, sizeof(int));
+    int *senddispls = xmalloc((size_t)num_procs, sizeof(int));
+
+    for (int r = 0; r < num_procs; r++) {
+        sendcounts[r] = counts[r] * n;
+        senddispls[r] = displs[r] * n;
+    }
+
+    int *mat_local = xmalloc((size_t)local_rows * n, sizeof(int));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+
+    MPI_Scatterv(mat, sendcounts, senddispls, MPI_INT,
+                 mat_local, local_rows * n, MPI_INT, ROOT, MPI_COMM_WORLD);
+
+    memcpy(x, x0, (size_t)n * sizeof(long long));
+
+    for (int it = 0; it < iterations; it++) {
+        spmv_dense(mat_local, x, y_local, local_rows, n);
+        MPI_Allgatherv(y_local, local_rows, MPI_LONG_LONG,
+                       x, counts, displs, MPI_LONG_LONG, MPI_COMM_WORLD);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double elapsed = MPI_Wtime() - start;
+
+    memcpy(out, x, (size_t)n * sizeof(long long));
+
+    free(sendcounts);
+    free(senddispls);
+    free(mat_local);
+    return elapsed;
+}
+
+/**
+ * @brief Run the iterative CSR multiplication serially on rank 0.
+ *
+ * Provides the correctness reference and the baseline for the speedup. The
+ * input and output vectors are swapped between iterations rather than copied.
+ *
+ * @param full       Full CSR matrix.
+ * @param x0         Initial input vector (size n).
+ * @param out        Output: final result vector (size n).
+ * @param n          Matrix dimension.
+ * @param iterations Number of multiplications to perform.
+ * @return Elapsed time, in seconds.
+ */
+static double run_csr_serial(const csr_matrix_t *full, const long long *x0,
+                             long long *out, int n, int iterations)
+{
+    long long *x = xmalloc((size_t)n, sizeof(long long));
+    long long *y = xmalloc((size_t)n, sizeof(long long));
+
+    memcpy(x, x0, (size_t)n * sizeof(long long));
+
+    double start = MPI_Wtime();
+
+    for (int it = 0; it < iterations; it++) {
+        spmv_csr(full, x, y);
+        long long *swap = x;
+        x = y;
+        y = swap;
+    }
+
+    double elapsed = MPI_Wtime() - start;
+
+    memcpy(out, x, (size_t)n * sizeof(long long));
+
+    free(x);
+    free(y);
+    return elapsed;
+}
+
+/**
+ * @brief Print the configuration and all required timings.
+ *
+ * @param t          Collected timings.
+ * @param n          Matrix dimension.
+ * @param sparsity   Percentage of zero elements requested.
+ * @param nnz        Number of non-zero elements actually generated.
+ * @param num_procs  Number of MPI ranks.
+ * @param iterations Number of multiplications performed.
+ */
+static void print_report(const timings_t *t, int n, int sparsity, int nnz,
+                         int num_procs, int iterations)
+{
+    printf("Matrix size:        %d x %d\n", n, n);
+    printf("Sparsity:           %d%%\n", sparsity);
+    printf("NNZ:                %d (%.1f%%)\n", nnz,
+           100.0 * nnz / ((double)n * n));
+    printf("Processes:          %d\n", num_procs);
+    printf("Iterations:         %d\n", iterations);
+    printf("\n");
+    printf("CSR build time:     %.6f s\n", t->csr_build);
+    printf("CSR send time:      %.6f s\n", t->csr_send);
+    printf("CSR compute time:   %.6f s\n", t->csr_compute);
+    printf("CSR total time:     %.6f s\n", t->csr_total);
+    printf("\n");
+    printf("Dense total time:   %.6f s\n", t->dense_total);
+    printf("CSR vs Dense:       %.2fx\n", t->dense_total / t->csr_total);
+    printf("\n");
+    printf("CSR serial time:    %.6f s\n", t->csr_serial);
+    printf("CSR speedup:        %.2fx\n", t->csr_serial / t->csr_total);
+}
+
 /**
  * @brief Program entry point.
  *
@@ -476,159 +664,82 @@ int main(int argc, char *argv[])
     int *mat = NULL;
     long long *x0 = xmalloc((size_t)n, sizeof(long long));
     csr_matrix_t full = { NULL, NULL, NULL, 0, 0 };
+    timings_t t = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 
+    /* Rank 0 generates the matrix and vector, then builds the CSR form. The
+     * generation is deliberately outside the timed region. */
     if (rank == ROOT) {
         fprintf(stderr, "[ex2] generating matrix and vector...\n");
         mat = generate_matrix(n, sparsity_pct);
-        long long *gen = generate_vector(n);
-        memcpy(x0, gen, (size_t)n * sizeof(long long));
-        free(gen);
-    }
+        long long *generated = generate_vector(n);
+        memcpy(x0, generated, (size_t)n * sizeof(long long));
+        free(generated);
 
-    /* Phase 1: build the CSR representation on rank 0. */
-    double t_csr_build = 0.0;
-
-    if (rank == ROOT) {
         fprintf(stderr, "[ex2] building CSR...\n");
-        double t0 = MPI_Wtime();
+        double start = MPI_Wtime();
         full = csr_build(mat, n);
-        t_csr_build = MPI_Wtime() - t0;
+        t.csr_build = MPI_Wtime() - start;
         fprintf(stderr, "[ex2] CSR built, NNZ=%d (%.1f%%) in %.6f s\n",
-                full.nnz, 100.0 * full.nnz / ((double)n * n), t_csr_build);
+                full.nnz, 100.0 * full.nnz / ((double)n * n), t.csr_build);
     }
 
-    MPI_Bcast(&t_csr_build, 1, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+    MPI_Bcast(&t.csr_build, 1, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
 
-    /* Phase 2: distribute the CSR rows and the initial vector. */
+    /* Distribute the CSR rows and the initial vector. */
     MPI_Barrier(MPI_COMM_WORLD);
-    double t1 = MPI_Wtime();
+    double send_start = MPI_Wtime();
 
     csr_matrix_t local;
     csr_scatter(&full, &local, counts, displs, rank, num_procs);
     MPI_Bcast(x0, n, MPI_LONG_LONG, ROOT, MPI_COMM_WORLD);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double t_csr_send = MPI_Wtime() - t1;
+    t.csr_send = MPI_Wtime() - send_start;
 
     if (rank == ROOT) {
-        fprintf(stderr, "[ex2] CSR distributed (%.6f s)\n", t_csr_send);
-        fprintf(stderr, "[ex2] running parallel CSR SpMV (%d iterations)...\n",
-                iterations);
+        fprintf(stderr, "[ex2] CSR distributed (%.6f s)\n", t.csr_send);
     }
 
     long long *x = xmalloc((size_t)n, sizeof(long long));
     long long *y_local = xmalloc((size_t)local_rows, sizeof(long long));
-    long long *result_csr_par = xmalloc((size_t)n, sizeof(long long));
+    long long *result_csr = xmalloc((size_t)n, sizeof(long long));
+    long long *result_dense = xmalloc((size_t)n, sizeof(long long));
 
-    /* Phase 3: iterative parallel CSR SpMV.
-     *
-     * Every rank computes the rows it owns, then all ranks exchange their
-     * partial result vectors so that each has the complete input vector for
-     * the next iteration. */
-    memcpy(x, x0, (size_t)n * sizeof(long long));
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t2 = MPI_Wtime();
-
-    for (int it = 0; it < iterations; it++) {
-        spmv_csr(&local, x, y_local);
-        MPI_Allgatherv(y_local, local_rows, MPI_LONG_LONG,
-                       x, counts, displs, MPI_LONG_LONG, MPI_COMM_WORLD);
+    if (rank == ROOT) {
+        fprintf(stderr, "[ex2] running parallel CSR SpMV (%d iterations)...\n",
+                iterations);
     }
+    t.csr_compute = run_csr_parallel(&local, x0, x, y_local, result_csr,
+                                     counts, displs, n, local_rows, iterations);
+    t.csr_total = t.csr_build + t.csr_send + t.csr_compute;
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_csr_compute = MPI_Wtime() - t2;
-
-    memcpy(result_csr_par, x, (size_t)n * sizeof(long long));
-
-    double t_csr_total = t_csr_build + t_csr_send + t_csr_compute;
-
-    /* Phase 4: the same iteration using the dense representation.
-     *
-     * Each rank receives the dense rows it owns, so the comparison is made at
-     * the same process count and with the same row decomposition. */
     if (rank == ROOT) {
         fprintf(stderr,
                 "[ex2] running parallel dense SpMV (%d iterations)...\n",
                 iterations);
     }
+    t.dense_total = run_dense_parallel(mat, x0, x, y_local, result_dense,
+                                       counts, displs, n, local_rows,
+                                       num_procs, iterations);
 
-    int *sendcounts = xmalloc((size_t)num_procs, sizeof(int));
-    int *senddispls = xmalloc((size_t)num_procs, sizeof(int));
-    for (int r = 0; r < num_procs; r++) {
-        sendcounts[r] = counts[r] * n;
-        senddispls[r] = displs[r] * n;
-    }
-
-    int *mat_local = xmalloc((size_t)local_rows * n, sizeof(int));
-    long long *result_dense_par = xmalloc((size_t)n, sizeof(long long));
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t3 = MPI_Wtime();
-
-    MPI_Scatterv(mat, sendcounts, senddispls, MPI_INT,
-                 mat_local, local_rows * n, MPI_INT, ROOT, MPI_COMM_WORLD);
-
-    memcpy(x, x0, (size_t)n * sizeof(long long));
-
-    for (int it = 0; it < iterations; it++) {
-        spmv_dense(mat_local, x, y_local, local_rows, n);
-        MPI_Allgatherv(y_local, local_rows, MPI_LONG_LONG,
-                       x, counts, displs, MPI_LONG_LONG, MPI_COMM_WORLD);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_dense_total = MPI_Wtime() - t3;
-
-    memcpy(result_dense_par, x, (size_t)n * sizeof(long long));
-
-    /* Rank 0 runs the serial CSR version as the correctness reference and the
-     * baseline for speedup. */
     int ok = 1;
 
     if (rank == ROOT) {
         fprintf(stderr, "[ex2] running serial CSR SpMV (%d iterations)...\n",
                 iterations);
 
-        long long *xs = xmalloc((size_t)n, sizeof(long long));
-        long long *ys = xmalloc((size_t)n, sizeof(long long));
-        memcpy(xs, x0, (size_t)n * sizeof(long long));
+        long long *reference = xmalloc((size_t)n, sizeof(long long));
+        t.csr_serial = run_csr_serial(&full, x0, reference, n, iterations);
 
-        double t4 = MPI_Wtime();
-        for (int it = 0; it < iterations; it++) {
-            spmv_csr(&full, xs, ys);
-            long long *tmp = xs;
-            xs = ys;
-            ys = tmp;
-        }
-        double t_csr_serial = MPI_Wtime() - t4;
-
-        printf("Matrix size:        %d x %d\n", n, n);
-        printf("Sparsity:           %d%%\n", sparsity_pct);
-        printf("NNZ:                %d (%.1f%%)\n", full.nnz,
-               100.0 * full.nnz / ((double)n * n));
-        printf("Processes:          %d\n", num_procs);
-        printf("Iterations:         %d\n", iterations);
-        printf("\n");
-        printf("CSR build time:     %.6f s\n", t_csr_build);
-        printf("CSR send time:      %.6f s\n", t_csr_send);
-        printf("CSR compute time:   %.6f s\n", t_csr_compute);
-        printf("CSR total time:     %.6f s\n", t_csr_total);
-        printf("\n");
-        printf("Dense total time:   %.6f s\n", t_dense_total);
-        printf("CSR vs Dense:       %.2fx\n", t_dense_total / t_csr_total);
-        printf("\n");
-        printf("CSR serial time:    %.6f s\n", t_csr_serial);
-        printf("CSR speedup:        %.2fx\n", t_csr_serial / t_csr_total);
+        print_report(&t, n, sparsity_pct, full.nnz, num_procs, iterations);
 
         fprintf(stderr, "[ex2] verifying results...\n");
-        ok = vectors_match(xs, result_csr_par, n) &&
-             vectors_match(xs, result_dense_par, n);
+        ok = vectors_match(reference, result_csr, n) &&
+             vectors_match(reference, result_dense, n);
         printf("\nCorrectness:        %s\n", ok ? "[OK]" : "[FAIL]");
         fprintf(stderr, "[ex2] done\n");
 
-        free(xs);
-        free(ys);
+        free(reference);
         csr_free(&full);
         free(mat);
     }
@@ -638,14 +749,11 @@ int main(int argc, char *argv[])
     csr_free(&local);
     free(counts);
     free(displs);
-    free(sendcounts);
-    free(senddispls);
-    free(mat_local);
     free(x0);
     free(x);
     free(y_local);
-    free(result_csr_par);
-    free(result_dense_par);
+    free(result_csr);
+    free(result_dense);
 
     MPI_Finalize();
     return ok ? 0 : 2;

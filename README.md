@@ -46,7 +46,7 @@ GCC with OpenMP support
 Open MPI (mpicc, mpirun)
 GNU Make
 bash, awk, sort
-A CPU with AVX2 (for 2.3)
+A CPU with AVX2 (exercise 2.3)
 ```
 
 
@@ -66,7 +66,7 @@ make clean
 ## Running
 
 ```bash
-mpirun -np <procs> ./bin/ex1 <degree> [omp_threads]
+mpirun -np <procs> ./bin/ex1 <degree> [num_threads]
 mpirun -np <procs> ./bin/ex2 <matrix_size> <sparsity_pct> <iterations>
 ./bin/ex3 <degree>
 ```
@@ -141,8 +141,11 @@ result array has far more contributing terms than the edges.
 The three phases required by the assignment are timed separately: the scatter
 and broadcast (send), the local convolution (compute), and the reduction
 (receive). Rank 0 also runs the serial algorithm and an OpenMP version with a
-matching worker count, so the single-node MPI versus shared-memory comparison
-can be made directly from one run.
+matching worker count. Pthreads is used rather than OpenMP because it was the
+faster of the two shared-memory versions measured in Exercise 1.1, and the
+assignment asks for the comparison against the fastest one. The kernel is
+carried over unchanged from Exercise 1.1, so the comparison is against the
+actual implementation from that assignment rather than a re-derived one.
 
 ### Exercise 2.2 — Sparse matrix-vector multiplication with MPI and CSR
 
@@ -175,14 +178,6 @@ multiply but no efficient packed 64-bit multiply, so 32-bit storage is what
 makes the vector path worthwhile. Coefficients are kept small so products stay
 well inside the 32-bit range, and both paths use the same type, so they agree
 exactly.
-
-### Exercise 2.4 — Maxwell's equations simulator with CUDA
-
-Completed in the NVIDIA DLI course "Getting Started with Accelerated Computing
-in Modern CUDA C++". The assessment accelerates a 2D Maxwell's equations
-simulator in three stages, each of which must clear a throughput threshold in
-cells per second: port the CPU simulator to the GPU, accelerate it with fancy
-iterators, and coarsen the grid with cooperative algorithms.
 
 ## Notes on comparing results
 

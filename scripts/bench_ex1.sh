@@ -16,7 +16,7 @@ SYSTEM_FILE="$RESULTS_DIR/bench_ex1_system.txt"
 mkdir -p "$RESULTS_DIR"
 collect_system_info "$SYSTEM_FILE"
 
-echo "sweep,degree,procs,repeat,serial,mpi_send,mpi_compute,mpi_receive,mpi_total,mpi_speedup,openmp,openmp_speedup,correctness" \
+echo "sweep,degree,procs,repeat,serial,mpi_send,mpi_compute,mpi_receive,mpi_total,mpi_speedup,pthreads,pthreads_speedup,correctness" \
     > "$RESULTS_FILE"
 
 run_ex1() {
@@ -24,27 +24,27 @@ run_ex1() {
     local output
     output=$(mpirun $MPIRUN_FLAGS -np "$procs" "$BINDIR/ex1" "$degree" "$procs" 2>/dev/null)
 
-    local ser send comp recv tot spd omp ospd ok
+    local ser send comp recv tot spd pth pspd ok
     ser=$(echo  "$output" | awk '/Serial time:/    {print $3}')
     send=$(echo "$output" | awk '/MPI send time:/  {print $4}')
     comp=$(echo "$output" | awk '/MPI compute:/    {print $3}')
     recv=$(echo "$output" | awk '/MPI receive:/    {print $3}')
     tot=$(echo  "$output" | awk '/MPI total:/      {print $3}')
     spd=$(echo  "$output" | awk '/MPI speedup:/    {print $3}' | tr -d 'x')
-    omp=$(echo  "$output" | awk '/OpenMP time:/    {print $3}')
-    ospd=$(echo "$output" | awk '/OpenMP speedup:/ {print $3}' | tr -d 'x')
+    pth=$(echo  "$output" | awk '/Pthreads time:/    {print $3}')
+    pspd=$(echo "$output" | awk '/Pthreads speedup:/ {print $3}' | tr -d 'x')
     ok=$(echo   "$output" | awk '/Correctness:/    {print $2}' | tr -d '[]')
 
     if [ -z "$ser" ] || [ -z "$send" ] || [ -z "$comp" ] || [ -z "$recv" ] || \
-       [ -z "$tot" ] || [ -z "$omp" ] || [ -z "$ok" ]; then
+       [ -z "$tot" ] || [ -z "$pth" ] || [ -z "$ok" ]; then
         echo "Error: failed to parse output for degree=$degree procs=$procs"
         echo "$output"
         exit 1
     fi
 
-    echo "$sweep,$degree,$procs,$repeat,$ser,$send,$comp,$recv,$tot,$spd,$omp,$ospd,$ok" \
+    echo "$sweep,$degree,$procs,$repeat,$ser,$send,$comp,$recv,$tot,$spd,$pth,$pspd,$ok" \
         >> "$RESULTS_FILE"
-    echo "[bench] sweep=$sweep degree=$degree procs=$procs repeat=$repeat mpi_total=$tot openmp=$omp"
+    echo "[bench] sweep=$sweep degree=$degree procs=$procs repeat=$repeat mpi_total=$tot pthreads=$pth"
 }
 
 echo "[bench] sweep 1: varying processes"

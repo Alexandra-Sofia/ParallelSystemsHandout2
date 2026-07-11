@@ -13,13 +13,15 @@
  * and the reduction (receive). The total excludes allocation and generation.
  *
  * Rank 0 also runs the serial O(n^2) algorithm for verification and speedup,
- * and an OpenMP version with the same worker count, so the MPI and shared
- * memory implementations can be compared on a single node.
+ * and the Pthreads implementation from Exercise 1.1 with the same worker
+ * count. Pthreads was the faster of the two shared-memory versions measured
+ * in Exercise 1.1, so it is the reference the assignment asks to compare the
+ * MPI implementation against on a single node.
  *
  * Usage:
- *   mpirun -np <procs> ./ex1 <degree> [omp_threads]
+ *   mpirun -np <procs> ./ex1 <degree> [num_threads]
  *
- * omp_threads defaults to the number of MPI processes.
+ * num_threads defaults to the number of MPI processes.
  *
  * Example:
  *   mpirun -np 4 ./ex1 100000
@@ -28,7 +30,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <mpi.h>
-#include <omp.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +39,31 @@
 #define MAX_DEGREE 2000000
 #define MAX_THREADS 256
 #define ROOT 0
+
+/**
+ * @brief Arguments passed to each Pthreads worker thread.
+ */
+typedef struct {
+    int *a;            /**< Coefficients of the first polynomial. */
+    int *b;            /**< Coefficients of the second polynomial. */
+    long long *result; /**< Output array (size 2*degree+1). */
+    int degree;        /**< Degree of each input polynomial. */
+    int thread_id;     /**< Zero-based index of this thread. */
+    int num_threads;   /**< Total number of worker threads. */
+} poly_args_t;
+
+/**
+ * @brief The timings the assignment requires the program to report.
+ */
+typedef struct {
+    double init;     /**< Allocating and generating the polynomials. */
+    double serial;   /**< The serial reference multiplication. */
+    double send;     /**< Scattering A and broadcasting B. */
+    double compute;  /**< The local convolution on every rank. */
+    double receive;  /**< Reducing the partial products onto rank 0. */
+    double mpi;      /**< Send plus compute plus receive. */
+    double pthreads; /**< The shared-memory reference from Exercise 1.1. */
+} timings_t;
 
 /**
  * @brief Parse a string as a positive integer using strtol.
@@ -90,15 +117,15 @@ static int parse_positive_int(const char *str, int *out, int max,
  * @param argc        Argument count from main.
  * @param argv        Argument vector from main.
  * @param degree      Output: parsed polynomial degree.
- * @param omp_threads Output: OpenMP thread count for the comparison run.
+ * @param num_threads Output: Pthreads thread count for the comparison run.
  * @param num_procs   Number of MPI processes, used as the thread default.
  * @return 1 if all arguments are valid, 0 otherwise.
  */
-static int parse_args(int argc, char *argv[], int *degree, int *omp_threads,
+static int parse_args(int argc, char *argv[], int *degree, int *num_threads,
                       int num_procs)
 {
     if (argc != 2 && argc != 3) {
-        fprintf(stderr, "Usage: mpirun -np <procs> %s <degree> [omp_threads]\n",
+        fprintf(stderr, "Usage: mpirun -np <procs> %s <degree> [num_threads]\n",
                 argv[0]);
         return 0;
     }
@@ -108,12 +135,12 @@ static int parse_args(int argc, char *argv[], int *degree, int *omp_threads,
     }
 
     if (argc == 3) {
-        if (!parse_positive_int(argv[2], omp_threads, MAX_THREADS,
-                                "omp_threads")) {
+        if (!parse_positive_int(argv[2], num_threads, MAX_THREADS,
+                                "num_threads")) {
             return 0;
         }
     } else {
-        *omp_threads = num_procs;
+        *num_threads = num_procs;
     }
 
     return 1;
@@ -178,31 +205,32 @@ static void poly_multiply_serial(int *a, int *b, long long *result, int degree)
 }
 
 /**
- * @brief Multiply two polynomials in parallel using OpenMP.
+ * @brief Worker function executed by each Pthreads thread.
  *
- * Parallelises over output coefficients, so each iteration writes a distinct
- * index and no reduction or critical section is needed. This mirrors the
- * fastest shared-memory version from Exercise 1.1 and exists so the MPI
- * implementation can be compared against it on a single node.
+ * Uses cyclic (interleaved) distribution over output coefficients rather
+ * than block distribution. Thread t computes k = t, t+T, t+2T, ... where
+ * T is the total thread count. This balances load naturally: the work per
+ * coefficient k peaks at the middle of the result array (degree+1 terms)
+ * and tapers toward the edges. Cyclic distribution gives every thread a
+ * mix of cheap and expensive coefficients, avoiding the imbalance that
+ * block distribution creates when the middle threads receive all the heavy
+ * coefficients.
  *
- * @param a           Coefficients of the first polynomial (size degree+1).
- * @param b           Coefficients of the second polynomial (size degree+1).
- * @param result      Output array (size 2*degree+1), pre-zeroed.
- * @param degree      Degree of each input polynomial.
- * @param num_threads Number of OpenMP threads to use.
+ * No synchronisation is required because each k is owned by exactly one
+ * thread.
+ *
+ * @param arg Pointer to a poly_args_t struct for this thread.
+ * @return NULL always.
  */
-static void poly_multiply_openmp(int *a, int *b, long long *result, int degree,
-                                 int num_threads)
+static void *pthread_worker(void *arg)
 {
-    int size = degree + 1;
-    int result_size = 2 * degree + 1;
+    poly_args_t *args = (poly_args_t *)arg;
+    int size = args->degree + 1;
+    int result_size = 2 * args->degree + 1;
 
-    omp_set_num_threads(num_threads);
-
-    #pragma omp parallel for schedule(static, 1)
-    for (int k = 0; k < result_size; k++) {
+    for (int k = args->thread_id; k < result_size; k += args->num_threads) {
         long long sum = 0;
-        int i_start = k - degree;
+        int i_start = k - args->degree;
         if (i_start < 0) {
             i_start = 0;
         }
@@ -211,10 +239,57 @@ static void poly_multiply_openmp(int *a, int *b, long long *result, int degree,
             i_end = size - 1;
         }
         for (int i = i_start; i <= i_end; i++) {
-            sum += (long long)a[i] * b[k - i];
+            sum += (long long)args->a[i] * args->b[k - i];
         }
-        result[k] = sum;
+        args->result[k] = sum;
     }
+    return NULL;
+}
+
+/**
+ * @brief Multiply two polynomials in parallel using Pthreads.
+ *
+ * Spawns num_threads threads with cyclic distribution over output
+ * coefficients. Each thread computes its assigned indices independently.
+ *
+ * @param a           Coefficients of the first polynomial (size degree+1).
+ * @param b           Coefficients of the second polynomial (size degree+1).
+ * @param result      Output array (size 2*degree+1), pre-zeroed.
+ * @param degree      Degree of each input polynomial.
+ * @param num_threads Number of Pthreads worker threads to spawn.
+ */
+static void poly_multiply_pthreads(int *a, int *b, long long *result,
+                                   int degree, int num_threads)
+{
+    pthread_t *threads = xmalloc((size_t)num_threads, sizeof(pthread_t));
+    poly_args_t *args = xmalloc((size_t)num_threads, sizeof(poly_args_t));
+
+    for (int t = 0; t < num_threads; t++) {
+        args[t].a = a;
+        args[t].b = b;
+        args[t].result = result;
+        args[t].degree = degree;
+        args[t].thread_id = t;
+        args[t].num_threads = num_threads;
+
+        int rc = pthread_create(&threads[t], NULL, pthread_worker, &args[t]);
+        if (rc != 0) {
+            fprintf(stderr, "Error: pthread_create failed for thread %d: %s\n",
+                    t, strerror(rc));
+            exit(1);
+        }
+    }
+    for (int t = 0; t < num_threads; t++) {
+        int rc = pthread_join(threads[t], NULL);
+        if (rc != 0) {
+            fprintf(stderr, "Error: pthread_join failed for thread %d: %s\n",
+                    t, strerror(rc));
+            exit(1);
+        }
+    }
+
+    free(threads);
+    free(args);
 }
 
 /**
@@ -291,15 +366,104 @@ static int results_match(long long *a, long long *b, int size)
     return 1;
 }
 
+
+/**
+ * @brief Run the MPI multiplication in its three timed phases.
+ *
+ * Rank 0 scatters the coefficients of A and broadcasts B in full, every rank
+ * convolves its slice into a full-length partial product, and the partials are
+ * summed onto rank 0. The phases are separated by barriers so that each
+ * reported time is the time of the slowest rank rather than rank 0's local
+ * view, which is what makes the numbers meaningful.
+ *
+ * @param a          Full first polynomial on rank 0; ignored elsewhere.
+ * @param b          Second polynomial buffer (size degree+1) on every rank.
+ * @param a_local    Scratch buffer for this rank's slice of A.
+ * @param partial    Scratch buffer (size 2*degree+1), pre-zeroed.
+ * @param result     Output on rank 0 (size 2*degree+1); ignored elsewhere.
+ * @param counts     Coefficient count per rank.
+ * @param displs     First coefficient index per rank.
+ * @param rank       This rank.
+ * @param degree     Degree of each input polynomial.
+ * @param t          Output: the send, compute, receive, and mpi timings.
+ */
+static void run_mpi_multiply(int *a, int *b, int *a_local, long long *partial,
+                             long long *result, const int *counts,
+                             const int *displs, int rank, int degree,
+                             timings_t *t)
+{
+    int size = degree + 1;
+    int result_size = 2 * degree + 1;
+    int local_count = counts[rank];
+    int local_displ = displs[rank];
+
+    /* Phase 1: distribute the data. A is scattered, B is broadcast in full. */
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+
+    MPI_Scatterv(a, counts, displs, MPI_INT,
+                 a_local, local_count, MPI_INT, ROOT, MPI_COMM_WORLD);
+    MPI_Bcast(b, size, MPI_INT, ROOT, MPI_COMM_WORLD);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    t->send = MPI_Wtime() - start;
+
+    /* Phase 2: local convolution of this rank's slice against all of B. */
+    start = MPI_Wtime();
+
+    poly_multiply_local(a_local, local_count, local_displ, b, partial, degree);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    t->compute = MPI_Wtime() - start;
+
+    /* Phase 3: the overlapping partials are summed onto rank 0. */
+    start = MPI_Wtime();
+
+    MPI_Reduce(partial, result, result_size, MPI_LONG_LONG, MPI_SUM,
+               ROOT, MPI_COMM_WORLD);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    t->receive = MPI_Wtime() - start;
+
+    t->mpi = t->send + t->compute + t->receive;
+}
+
+/**
+ * @brief Print the configuration and all required timings.
+ *
+ * @param t           Collected timings.
+ * @param degree      Degree of each input polynomial.
+ * @param num_procs   Number of MPI ranks.
+ * @param num_threads Threads used by the shared-memory reference.
+ */
+static void print_report(const timings_t *t, int degree, int num_procs,
+                         int num_threads)
+{
+    printf("Degree:           %d\n", degree);
+    printf("Init time:        %.6f s\n", t->init);
+    printf("Serial time:      %.6f s\n", t->serial);
+    printf("\n");
+    printf("MPI send time:    %.6f s\n", t->send);
+    printf("MPI compute:      %.6f s\n", t->compute);
+    printf("MPI receive:      %.6f s\n", t->receive);
+    printf("MPI total:        %.6f s  [%d procs]\n", t->mpi, num_procs);
+    printf("MPI speedup:      %.2fx\n", t->serial / t->mpi);
+    printf("\n");
+    printf("Pthreads time:    %.6f s  [%d threads]\n", t->pthreads,
+           num_threads);
+    printf("Pthreads speedup: %.2fx\n", t->serial / t->pthreads);
+    printf("MPI vs Pthreads:  %.2fx\n", t->pthreads / t->mpi);
+}
+
 /**
  * @brief Program entry point.
  *
  * Parses arguments, generates the polynomials on rank 0, runs the MPI
- * multiplication in three timed phases, runs the serial and OpenMP versions on
- * rank 0 for comparison, prints timings, and verifies correctness.
+ * multiplication in three timed phases, runs the serial and Pthreads versions
+ * on rank 0 for comparison, prints timings, and verifies correctness.
  *
  * @param argc Argument count.
- * @param argv Argument vector: degree, optional omp_threads.
+ * @param argv Argument vector: degree, optional num_threads.
  * @return 0 on success, 1 on argument error, 2 on correctness failure.
  */
 int main(int argc, char *argv[])
@@ -312,9 +476,9 @@ int main(int argc, char *argv[])
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
     int degree;
-    int omp_threads;
+    int num_threads;
 
-    if (!parse_args(argc, argv, &degree, &omp_threads, num_procs)) {
+    if (!parse_args(argc, argv, &degree, &num_threads, num_procs)) {
         MPI_Finalize();
         return 1;
     }
@@ -323,33 +487,34 @@ int main(int argc, char *argv[])
     int result_size = 2 * degree + 1;
 
     if (rank == ROOT) {
-        fprintf(stderr, "[ex1] degree=%d procs=%d omp_threads=%d\n",
-                degree, num_procs, omp_threads);
-        fprintf(stderr, "[ex1] allocating and generating polynomials...\n");
+        fprintf(stderr, "[ex1] degree=%d procs=%d threads=%d\n",
+                degree, num_procs, num_threads);
     }
 
     int *counts = xmalloc((size_t)num_procs, sizeof(int));
     int *displs = xmalloc((size_t)num_procs, sizeof(int));
     compute_distribution(size, num_procs, counts, displs);
 
-    int local_count = counts[rank];
-    int local_displ = displs[rank];
-
-    double t_start = MPI_Wtime();
+    timings_t t = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 
     int *a = NULL;
     long long *result_serial = NULL;
-    long long *result_openmp = NULL;
+    long long *result_pthreads = NULL;
     long long *result_mpi = NULL;
 
     int *b = xmalloc((size_t)size, sizeof(int));
-    int *a_local = xcalloc((size_t)local_count, sizeof(int));
+    int *a_local = xcalloc((size_t)counts[rank], sizeof(int));
     long long *partial = xcalloc((size_t)result_size, sizeof(long long));
 
+    /* Rank 0 generates both polynomials. The generation is deliberately
+     * outside the timed region of the parallel computation. */
     if (rank == ROOT) {
+        fprintf(stderr, "[ex1] allocating and generating polynomials...\n");
+        double start = MPI_Wtime();
+
         a = xmalloc((size_t)size, sizeof(int));
         result_serial = xcalloc((size_t)result_size, sizeof(long long));
-        result_openmp = xcalloc((size_t)result_size, sizeof(long long));
+        result_pthreads = xcalloc((size_t)result_size, sizeof(long long));
         result_mpi = xcalloc((size_t)result_size, sizeof(long long));
 
         srand(SEED);
@@ -357,79 +522,38 @@ int main(int argc, char *argv[])
             a[i] = (rand() % 100) + 1;
             b[i] = (rand() % 100) + 1;
         }
-    }
 
-    double t_init = MPI_Wtime() - t_start;
-
-    if (rank == ROOT) {
-        printf("Init time:      %.6f s\n", t_init);
-        fprintf(stderr, "[ex1] init done (%.6f s)\n", t_init);
+        t.init = MPI_Wtime() - start;
+        fprintf(stderr, "[ex1] init done (%.6f s)\n", t.init);
         fprintf(stderr, "[ex1] running MPI multiply...\n");
     }
 
-    /* Phase 1: distribute the data. A is scattered, B is broadcast in full. */
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t0 = MPI_Wtime();
-
-    MPI_Scatterv(a, counts, displs, MPI_INT,
-                 a_local, local_count, MPI_INT, ROOT, MPI_COMM_WORLD);
-    MPI_Bcast(b, size, MPI_INT, ROOT, MPI_COMM_WORLD);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_send = MPI_Wtime() - t0;
-
-    /* Phase 2: local convolution of this rank's slice against all of B. */
-    double t1 = MPI_Wtime();
-
-    poly_multiply_local(a_local, local_count, local_displ, b, partial, degree);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_compute = MPI_Wtime() - t1;
-
-    /* Phase 3: overlapping partials are summed onto rank 0. */
-    double t2 = MPI_Wtime();
-
-    MPI_Reduce(partial, result_mpi, result_size, MPI_LONG_LONG, MPI_SUM,
-               ROOT, MPI_COMM_WORLD);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_receive = MPI_Wtime() - t2;
-
-    double t_mpi_total = t_send + t_compute + t_receive;
+    run_mpi_multiply(a, b, a_local, partial, result_mpi, counts, displs,
+                     rank, degree, &t);
 
     int ok = 1;
 
     if (rank == ROOT) {
-        fprintf(stderr, "[ex1] MPI done (%.6f s)\n", t_mpi_total);
+        fprintf(stderr, "[ex1] MPI done (%.6f s)\n", t.mpi);
 
         fprintf(stderr, "[ex1] running serial multiply...\n");
-        double t3 = MPI_Wtime();
+        double start = MPI_Wtime();
         poly_multiply_serial(a, b, result_serial, degree);
-        double t_serial = MPI_Wtime() - t3;
-        fprintf(stderr, "[ex1] serial done (%.6f s)\n", t_serial);
+        t.serial = MPI_Wtime() - start;
+        fprintf(stderr, "[ex1] serial done (%.6f s)\n", t.serial);
 
-        fprintf(stderr, "[ex1] running OpenMP multiply...\n");
-        double t4 = MPI_Wtime();
-        poly_multiply_openmp(a, b, result_openmp, degree, omp_threads);
-        double t_openmp = MPI_Wtime() - t4;
-        fprintf(stderr, "[ex1] OpenMP done (%.6f s)\n", t_openmp);
+        fprintf(stderr, "[ex1] running Pthreads multiply...\n");
+        start = MPI_Wtime();
+        poly_multiply_pthreads(a, b, result_pthreads, degree, num_threads);
+        t.pthreads = MPI_Wtime() - start;
+        fprintf(stderr, "[ex1] Pthreads done (%.6f s)\n", t.pthreads);
 
-        printf("Serial time:    %.6f s\n", t_serial);
-        printf("\n");
-        printf("MPI send time:  %.6f s\n", t_send);
-        printf("MPI compute:    %.6f s\n", t_compute);
-        printf("MPI receive:    %.6f s\n", t_receive);
-        printf("MPI total:      %.6f s  [%d procs]\n", t_mpi_total, num_procs);
-        printf("MPI speedup:    %.2fx\n", t_serial / t_mpi_total);
-        printf("\n");
-        printf("OpenMP time:    %.6f s  [%d threads]\n", t_openmp, omp_threads);
-        printf("OpenMP speedup: %.2fx\n", t_serial / t_openmp);
-        printf("MPI vs OpenMP:  %.2fx\n", t_openmp / t_mpi_total);
+        print_report(&t, degree, num_procs, num_threads);
 
         fprintf(stderr, "[ex1] verifying results...\n");
         ok = results_match(result_serial, result_mpi, result_size) &&
-             results_match(result_serial, result_openmp, result_size);
-        printf("\nCorrectness:    %s\n", ok ? "[OK]" : "[FAIL]");
+             results_match(result_serial, result_pthreads, result_size);
+        printf("\nCorrectness:      %s\n", ok ? "[OK]" : "[FAIL]");
         fprintf(stderr, "[ex1] done\n");
     }
 
@@ -442,7 +566,7 @@ int main(int argc, char *argv[])
     free(partial);
     free(a);
     free(result_serial);
-    free(result_openmp);
+    free(result_pthreads);
     free(result_mpi);
 
     MPI_Finalize();
