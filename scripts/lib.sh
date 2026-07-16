@@ -8,7 +8,7 @@ BINDIR="bin"
 
 # Extra flags passed to mpirun. Leave empty on the department network; set to
 # "--allow-run-as-root --oversubscribe" when running inside a container.
-MPIRUN_FLAGS="${MPIRUN_FLAGS:-}"
+MPIRUN_FLAGS="${MPIRUN_FLAGS:---oversubscribe}"
 
 # ---------------------------------------------------------------------------
 # Guard: abort if required tools are missing
