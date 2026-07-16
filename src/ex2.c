@@ -51,7 +51,9 @@ typedef struct {
     double csr_compute; /**< The iterative parallel CSR multiplication. */
     double csr_total;   /**< Build plus send plus compute. */
     double dense_total; /**< The same iteration using the dense form. */
-    double csr_serial;  /**< The serial CSR reference run on rank 0. */
+    double serial_build;   /**< Building the CSR form in the serial run. */
+    double serial_compute; /**< The serial iterative multiplication. */
+    double serial_total;   /**< Serial build plus serial compute. */
 } timings_t;
 
 /**
@@ -540,12 +542,18 @@ static double run_dense_parallel(const int *mat, const long long *x0,
  * Provides the correctness reference and the baseline for the speedup. The
  * input and output vectors are swapped between iterations rather than copied.
  *
+ * Only the iterative multiplication is timed here. The serial run reuses the
+ * CSR representation that rank 0 already built, and that build time is reported
+ * separately, so that the parallel and serial totals can be compared like for
+ * like: both include one CSR build, and neither includes the generation of the
+ * dense matrix.
+ *
  * @param full       Full CSR matrix.
  * @param x0         Initial input vector (size n).
  * @param out        Output: final result vector (size n).
  * @param n          Matrix dimension.
  * @param iterations Number of multiplications to perform.
- * @return Elapsed time, in seconds.
+ * @return Elapsed time of the iterative multiplication, in seconds.
  */
 static double run_csr_serial(const csr_matrix_t *full, const long long *x0,
                              long long *out, int n, int iterations)
@@ -601,8 +609,13 @@ static void print_report(const timings_t *t, int n, int sparsity, int nnz,
     printf("Dense total time:   %.6f s\n", t->dense_total);
     printf("CSR vs Dense:       %.2fx\n", t->dense_total / t->csr_total);
     printf("\n");
-    printf("CSR serial time:    %.6f s\n", t->csr_serial);
-    printf("CSR speedup:        %.2fx\n", t->csr_serial / t->csr_total);
+    printf("Serial build time:  %.6f s\n", t->serial_build);
+    printf("Serial compute:     %.6f s\n", t->serial_compute);
+    printf("Serial total time:  %.6f s\n", t->serial_total);
+    printf("\n");
+    printf("Compute speedup:    %.2fx\n",
+           t->serial_compute / t->csr_compute);
+    printf("Total speedup:      %.2fx\n", t->serial_total / t->csr_total);
 }
 
 /**
@@ -645,7 +658,7 @@ int main(int argc, char *argv[])
     int *mat = NULL;
     long long *x0 = xmalloc((size_t)n, sizeof(long long));
     csr_matrix_t full = { NULL, NULL, NULL, 0, 0 };
-    timings_t t = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    timings_t t = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
 
     /* Rank 0 generates the matrix and vector, then builds the CSR form. The
      * generation is deliberately outside the timed region. */
@@ -710,7 +723,9 @@ int main(int argc, char *argv[])
                 iterations);
 
         long long *reference = xmalloc((size_t)n, sizeof(long long));
-        t.csr_serial = run_csr_serial(&full, x0, reference, n, iterations);
+        t.serial_build = t.csr_build;
+        t.serial_compute = run_csr_serial(&full, x0, reference, n, iterations);
+        t.serial_total = t.serial_build + t.serial_compute;
 
         print_report(&t, n, sparsity_pct, full.nnz, num_procs, iterations);
 

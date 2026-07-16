@@ -16,7 +16,7 @@ SYSTEM_FILE="$RESULTS_DIR/bench_ex2_system.txt"
 mkdir -p "$RESULTS_DIR"
 collect_system_info "$SYSTEM_FILE"
 
-echo "sweep,size,sparsity,iterations,procs,repeat,csr_build,csr_send,csr_compute,csr_total,dense_total,csr_vs_dense,csr_serial,csr_speedup,correctness" \
+echo "sweep,size,sparsity,iterations,procs,repeat,csr_build,csr_send,csr_compute,csr_total,dense_total,csr_vs_dense,serial_build,serial_compute,serial_total,compute_speedup,total_speedup,correctness" \
     > "$RESULTS_FILE"
 
 run_ex2() {
@@ -24,25 +24,28 @@ run_ex2() {
     local output
     output=$(mpirun $MPIRUN_FLAGS -np "$procs" "$BINDIR/ex2" "$size" "$sparsity" "$iters" 2>/dev/null)
 
-    local build send comp tot dense cvd ser spd ok
+    local build send comp tot dense cvd sbuild scomp stot cspd tspd ok
     build=$(echo "$output" | awk '/CSR build time:/   {print $4}')
     send=$(echo  "$output" | awk '/CSR send time:/    {print $4}')
     comp=$(echo  "$output" | awk '/CSR compute time:/ {print $4}')
     tot=$(echo   "$output" | awk '/CSR total time:/   {print $4}')
     dense=$(echo "$output" | awk '/Dense total time:/ {print $4}')
     cvd=$(echo   "$output" | awk '/CSR vs Dense:/     {print $4}' | tr -d 'x')
-    ser=$(echo   "$output" | awk '/CSR serial time:/  {print $4}')
-    spd=$(echo   "$output" | awk '/CSR speedup:/      {print $3}' | tr -d 'x')
+    sbuild=$(echo "$output" | awk '/Serial build time:/ {print $4}')
+    scomp=$(echo  "$output" | awk '/Serial compute:/    {print $3}')
+    stot=$(echo   "$output" | awk '/Serial total time:/ {print $4}')
+    cspd=$(echo   "$output" | awk '/Compute speedup:/   {print $3}' | tr -d 'x')
+    tspd=$(echo   "$output" | awk '/Total speedup:/     {print $3}' | tr -d 'x')
     ok=$(echo    "$output" | awk '/Correctness:/      {print $2}' | tr -d '[]')
 
     if [ -z "$build" ] || [ -z "$send" ] || [ -z "$comp" ] || [ -z "$tot" ] || \
-       [ -z "$dense" ] || [ -z "$ser" ] || [ -z "$ok" ]; then
+       [ -z "$dense" ] || [ -z "$scomp" ] || [ -z "$ok" ]; then
         echo "Error: failed to parse output for size=$size sparsity=$sparsity procs=$procs"
         echo "$output"
         exit 1
     fi
 
-    echo "$sweep,$size,$sparsity,$iters,$procs,$repeat,$build,$send,$comp,$tot,$dense,$cvd,$ser,$spd,$ok" \
+    echo "$sweep,$size,$sparsity,$iters,$procs,$repeat,$build,$send,$comp,$tot,$dense,$cvd,$sbuild,$scomp,$stot,$cspd,$tspd,$ok" \
         >> "$RESULTS_FILE"
     echo "[bench] sweep=$sweep size=$size sparsity=$sparsity iters=$iters procs=$procs repeat=$repeat csr_total=$tot dense=$dense"
 }
