@@ -2,29 +2,11 @@
  * @file ex1.c
  * @brief Exercise 2.1 — Polynomial multiplication with MPI.
  *
- * Rank 0 generates two random dense polynomials of degree n. It scatters the
- * coefficients of the first polynomial across the ranks and broadcasts the
- * second in full, since every coefficient of A must be convolved against all
- * of B. Each rank computes a partial product over the full output range, and
- * the partials are summed onto rank 0 with a reduction.
+ * Rank 0 scatters polynomial A and broadcasts B, each rank convolves its
+ * slice, and the partials are reduced back to rank 0. The serial algorithm and
+ * the Pthreads version from Exercise 1.1 are run for comparison.
  *
- * The three communication and computation phases are timed separately, as
- * required: the scatter/broadcast (send), the local convolution (compute),
- * and the reduction (receive). The total excludes allocation and generation.
- *
- * Rank 0 also runs the serial O(n^2) algorithm for verification and speedup,
- * and the Pthreads implementation from Exercise 1.1 with the same worker
- * count. Pthreads was the faster of the two shared-memory versions measured
- * in Exercise 1.1, so it is the reference the assignment asks to compare the
- * MPI implementation against on a single node.
- *
- * Usage:
- *   mpirun -np <procs> ./ex1 <degree> [num_threads]
- *
- * num_threads defaults to the number of MPI processes.
- *
- * Example:
- *   mpirun -np 4 ./ex1 100000
+ * Usage: mpirun -np <procs> ./ex1 <degree> [num_threads]
  */
 
 #include <errno.h>

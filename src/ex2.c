@@ -2,31 +2,12 @@
  * @file ex2.c
  * @brief Exercise 2.2 — Sparse matrix-vector multiplication with MPI and CSR.
  *
- * Rank 0 builds a random sparse square matrix with a given percentage of zero
- * elements, converts it to Compressed Sparse Row (CSR) format, and distributes
- * the rows across the ranks. Each rank owns a contiguous block of rows and
- * receives only the CSR data for those rows, which is the minimal amount of
- * matrix data needed for the parallel computation.
+ * Rank 0 builds the matrix, converts it to CSR, and sends each rank only its
+ * own rows. The product is iterative, with an allgather of the result vector
+ * between iterations. The dense form and a serial CSR run are done for
+ * comparison.
  *
- * The multiplication is iterative: the result vector of each iteration becomes
- * the input vector of the next, modelling an iterative solver. Because a row
- * of the matrix may touch any column, every rank needs the complete input
- * vector at the start of each iteration. The partial result vectors are
- * therefore combined with an allgather after every iteration, which is the
- * synchronisation point of the algorithm.
- *
- * The same iteration is also run with the dense representation over MPI, so
- * the CSR and dense forms can be compared at identical process counts. Rank 0
- * additionally runs the serial CSR version, which provides the correctness
- * reference and the speedup baseline.
- *
- * Usage:
- *   mpirun -np <procs> ./ex2 <matrix_size> <sparsity_pct> <iterations>
- *
- * sparsity_pct: percentage of elements that are zero, e.g. 90 for 90% zeros.
- *
- * Example:
- *   mpirun -np 4 ./ex2 4000 90 10
+ * Usage: mpirun -np <procs> ./ex2 <matrix_size> <sparsity_pct> <iterations>
  */
 
 #include <errno.h>

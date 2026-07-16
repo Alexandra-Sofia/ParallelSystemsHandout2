@@ -2,28 +2,11 @@
  * @file ex3.c
  * @brief Exercise 2.3 — Polynomial multiplication with SIMD extensions.
  *
- * Generates two random dense polynomials of degree n, multiplies them with the
- * original scalar O(n^2) algorithm, then repeats the multiplication with a
- * vectorised algorithm that uses SIMD instructions and no threads. The two
- * results are compared element by element to confirm the vector path is exact.
+ * Multiplies two polynomials with the scalar algorithm and with an AVX2 kernel
+ * (eight 32-bit coefficients per instruction), then checks the results match.
+ * 32-bit integers are used because AVX2 has no efficient packed 64-bit multiply.
  *
- * The vector kernel broadcasts one coefficient of A into a vector register and
- * multiplies it against eight coefficients of B per instruction, accumulating
- * into the shifted output band. The trailing coefficients that do not fill a
- * full vector are handled with scalar code.
- *
- * Coefficients and accumulators are 32-bit. AVX2 provides a packed 32-bit
- * integer multiply (_mm256_mullo_epi32) but no efficient packed 64-bit
- * multiply, so 32-bit storage is what makes the vector path worthwhile. The
- * coefficients are kept small so that the products stay well inside the 32-bit
- * range, and the scalar and vector paths use the same type, so they agree
- * exactly rather than approximately.
- *
- * Usage:
- *   ./ex3 <degree>
- *
- * Example:
- *   ./ex3 100000
+ * Usage: ./ex3 <degree>
  */
 
 #include <errno.h>
