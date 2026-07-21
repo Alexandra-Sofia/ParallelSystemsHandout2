@@ -1,0 +1,28 @@
+Hostname:
+linux21
+
+CPU model:
+Model name:                         Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz
+
+CPU cores/threads:
+CPU(s):                             4
+On-line CPU(s) list:                0-3
+Thread(s) per core:                 1
+Core(s) per socket:                 4
+Socket(s):                          1
+NUMA node0 CPU(s):                  0-3
+
+SIMD support:
+avx avx2 fma sse sse2 sse4_1 sse4_2 ssse3 
+
+Operating system:
+Ubuntu 20.04.6 LTS
+
+Kernel:
+5.4.0-216-generic
+
+Compiler:
+gcc (Ubuntu 9.4.0-1ubuntu1~20.04.2) 9.4.0
+
+MPI:
+mpirun (Open MPI) 4.0.3
