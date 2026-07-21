@@ -55,7 +55,7 @@ for procs in 1 2 4 8; do
 done
 
 echo "[bench] sweep 2: varying degree"
-for degree in 10000 50000 100000 200000; do
+for degree in 10000 50000 100000 120000 130000 140000 160000 200000; do
     for repeat in $(seq 1 "$REPEATS"); do
         run_ex1 degree "$degree" 4 "$repeat"
     done
